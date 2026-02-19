@@ -1,0 +1,22 @@
+# Core dependencies
+streamlit==1.31.0
+python-dotenv==1.0.0
+
+# Google Gemini
+google-generativeai==0.3.2
+
+# Data processing
+pandas==2.1.4
+
+# Git operations
+GitPython==3.1.40
+
+# Utilities
+requests==2.31.0
+pathlib==1.0.1
+
+# Code parsing
+ast-comments==1.1.2
+
+# Optional for enhanced features
+plotly==5.18.0
