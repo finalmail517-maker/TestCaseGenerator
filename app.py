@@ -13,6 +13,7 @@ from csv_handler import CSVHandler
 from rag_system import RAGSystem
 from security import SecurityManager
 from logger import get_app_logger, TestGenerationLogger
+from lld_handler import LLDHandler
 
 # ---- Logger -------------------------------------------------------------------
 logger = get_app_logger("streamlit_app")
@@ -42,6 +43,13 @@ if "llm_handler" not in st.session_state:
     st.session_state.llm_handler = LLMHandler()
 if "security_manager" not in st.session_state:
     st.session_state.security_manager = SecurityManager()
+#lld----------------
+if "lld_handler" not in st.session_state:
+    st.session_state.lld_handler = LLDHandler(
+        st.session_state.llm_handler,
+        st.session_state.rag_system
+    )
+#------------------
 if "generated_tests" not in st.session_state:
     st.session_state.generated_tests = {}
 if "last_repo_info" not in st.session_state:
@@ -502,7 +510,104 @@ def display_chat():
     st.subheader("AI Test Case Generator")
     # Input section
     with st.container():
-        user_input = st.chat_input("Ask, paste Git URL, or type 'generate'...")
+        #---------lld ui----------------
+        user_input = st.chat_input("Ask, paste Git URL, upload LLD, or type 'generate'...")
+
+        lld_file = st.file_uploader(
+        "📄 Upload LLD Word Document (.docx)",
+        type=["docx"],
+        key="lld_uploader",
+        label_visibility="collapsed",
+        )
+
+        if lld_file is not None:
+            file_bytes = lld_file.read()
+            filename = lld_file.name
+
+            # Acknowledge upload in chat
+            upload_msg = f"📄 LLD document uploaded: **{filename}**. Generating test cases..."
+            st.session_state.chat_history.append(
+                {"role": "user", "content": f"Uploaded LLD: {filename}", "timestamp": datetime.now().isoformat()}
+            )
+            with st.chat_message("user"):
+                st.markdown(f"Uploaded LLD: **{filename}**")
+
+            with st.chat_message("assistant"):
+                with st.spinner("Reading LLD and generating test cases..."):
+                    import time
+                    start = time.time()
+
+                    # Use the LLD handler
+                    lld = st.session_state.lld_handler
+                    test_types = st.session_state.get("selected_test_types", ["Unit Test", "Functional Test"])
+                    tests = lld.process_lld_file(file_bytes, filename, test_types)
+
+                    st.session_state.generated_tests = tests
+                    st.session_state.rag_system.add_test_cases(tests, session_id="current")
+
+                    unit_count = len(tests.get("Unit Test", []))
+                    functional_count = len(tests.get("Functional Test", []))
+                    total = unit_count + functional_count
+                    elapsed = time.time() - start
+
+                    st.success(f"Generated **{total}** test cases from LLD in {elapsed:.2f}s")
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1: st.metric("Total", total)
+                    with c2: st.metric("Unit", unit_count)
+                    with c3: st.metric("Functional", functional_count)
+
+                    # Download buttons
+                    csv_h = CSVHandler()
+                    csv_file = csv_h.generate_csv_with_repo_name(
+                        tests, filename.replace(".docx", ""), change_info={}
+                    )
+                    report_file = csv_h.generate_professional_test_report(tests)
+
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        with open(csv_file, "rb") as f:
+                            st.download_button(
+                                "📥 Download CSV", data=f,
+                                file_name=f"lld_tests_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                                mime="text/csv",
+                            )
+                    with d2:
+                        with open(report_file, "rb") as f:
+                            st.download_button(
+                                "📥 Download Report", data=f,
+                                file_name=f"lld_report_{datetime.now():%Y%m%d_%H%M%S}.txt",
+                                mime="text/plain",
+                            )
+
+                    # Show test preview
+                    for ttype in test_types:
+                        lst = tests.get(ttype, [])
+                        if lst:
+                            with st.expander(f"{ttype}s ({len(lst)})", expanded=True):
+                                for i, t in enumerate(lst[:10], 1):
+                                    if t.get("format") == "professional":
+                                        display_professional_test(t, i)
+                                    else:
+                                        display_code_test(t, i)
+                                if len(lst) > 10:
+                                    st.info(f"... and {len(lst)-10} more (download CSV)")
+
+                    # Save to chat history
+                    bot_msg = (
+                        f"✅ Generated **{total}** test cases from LLD **{filename}**\n"
+                        f"- Unit Tests: {unit_count}\n"
+                        f"- Functional Tests: {functional_count}\n"
+                        f"- Time: {elapsed:.2f}s"
+                    )
+                    st.session_state.chat_history.append(
+                        {"role": "assistant", "content": bot_msg, "timestamp": datetime.now().isoformat()}
+                    )
+                    auto_save_chat()
+                    st.caption("💾 Chat auto-saved")
+
+#---------lld ui end----------------
+
         uploaded_files = None  #newline to remove fileupld
         # uploaded_files = st.file_uploader(
         #     "Attach code files",
