@@ -43,6 +43,12 @@ if "llm_handler" not in st.session_state:
     st.session_state.llm_handler = LLMHandler()
 if "security_manager" not in st.session_state:
     st.session_state.security_manager = SecurityManager()
+#neww
+if "last_lld_processed" not in st.session_state:
+    st.session_state.last_lld_processed = None
+if "lld_uploader_key" not in st.session_state:
+    st.session_state.lld_uploader_key = 0
+
 #lld----------------
 if "lld_handler" not in st.session_state:
     st.session_state.lld_handler = LLDHandler(
@@ -305,6 +311,8 @@ def clear_session_context():
     st.session_state.current_repo_path = None
     st.session_state.current_repo_csv = {}
     st.session_state.current_chat_file = None
+    st.session_state.lld_uploader_key += 1
+    st.session_state.last_lld_processed = None
     
     try:
         if hasattr(st.session_state, "rag_system"):
@@ -516,11 +524,15 @@ def display_chat():
         lld_file = st.file_uploader(
         "📄 Upload LLD Word Document (.docx)",
         type=["docx"],
-        key="lld_uploader",
+        key=f"lld_uploader_{st.session_state.lld_uploader_key}",
         label_visibility="collapsed",
         )
 
-        if lld_file is not None:
+        if lld_file is not None: #new
+            file_key = f"{lld_file.name}_{lld_file.size}"
+            if st.session_state.get("last_lld_processed") == file_key:
+                st.stop()
+            st.session_state.last_lld_processed = file_key
             file_bytes = lld_file.read()
             filename = lld_file.name
 
