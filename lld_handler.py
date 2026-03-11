@@ -15,7 +15,6 @@ Handles:
   - Validation sections → every rule as an assertion
 """
 
-import json
 import zipfile
 import io
 import re
@@ -31,7 +30,6 @@ HEADER_ROWS = {
     "method | endpoint | request body | response",
     "method | endpoint | auth required | description",
     "code | error | description",
-    "method | parameters | description",
 }
 
 
@@ -194,7 +192,7 @@ class LLDHandler:
             return "class"
         if any(k in combined for k in ["table:", "varchar", "int | pk", "boolean |", "datetime |", "text | not null"]):
             return "database"
-        if re.search(r'\b(validationerror|authenticationerror|forbiddenerror|notfounderror|conflicterror|ratelimiterror|servererror)\b', combined):
+        if re.search(r'\b(validationerror|authenticationerror|forbiddenerror|notfounderror|conflicterror|ratelimiterror|servererror|alreadysenterror|paymenterror|outofstockerror|providererror)\b', combined):
             return "error"
         if any(k in combined for k in ["flow", "sequence", "process"]):
             return "flow"
@@ -224,38 +222,26 @@ class LLDHandler:
 
             logger.info(f"  Section {i}/{len(sections)}: '{heading}' [{sec_type}]")
 
-            # Build plain text version for LLM prompt
-            content = "\n".join(text for _, text in section["lines"])
-            prompt = self._build_lld_prompt(heading, content, sec_type, test_type)
+            # Build chunk in same format as repo flow
+            chunk = {
+                'name': heading,
+                'type': sec_type,
+                'code': "\n".join(text for _, text in section["lines"]),
+                'line_start': 0,
+                'line_end': len(section["lines"])
+            }
 
             try:
-                response = self.llm._make_request(prompt)
+                # Use same method as test_generator.py — no custom prompts, no hardcoded counts
+                tests = self.llm.generate_tests_for_chunk(chunk, test_type, filename)
 
-                if not response or response.startswith("Error:"):
-                    logger.warning(f"⚠️ LLM failed for '{heading}' — using smart fallback")
-                    fallbacks = self._smart_fallback(section, test_type, filename, tc_index)
-                    all_tests.extend(fallbacks)
-                    tc_index += len(fallbacks)
-                    continue
+                for test in tests:
+                    test['source'] = 'lld'
+                    test['chunk_type'] = sec_type
 
-                parsed = self._parse_lld_response(response, test_type, section, filename)
-
-                if not parsed:
-                    logger.warning(f"⚠️ Parse failed for '{heading}' — using smart fallback")
-                    fallbacks = self._smart_fallback(section, test_type, filename, tc_index)
-                    all_tests.extend(fallbacks)
-                    tc_index += len(fallbacks)
-                    continue
-
-                for test in parsed:
-                    test["file"] = filename
-                    test["chunk_name"] = heading
-                    test["chunk_type"] = sec_type
-                    test["source"] = "lld"
-
-                all_tests.extend(parsed)
-                tc_index += len(parsed)
-                logger.info(f"    ✅ {len(parsed)} LLM tests for '{heading}'")
+                all_tests.extend(tests)
+                tc_index += len(tests)
+                logger.info(f"    ✅ {len(tests)} tests for '{heading}'")
 
             except Exception as e:
                 logger.error(f"    ❌ Exception on '{heading}': {e}")
@@ -264,93 +250,6 @@ class LLDHandler:
                 tc_index += len(fallbacks)
 
         return all_tests
-
-    def _parse_lld_response(self, response, test_type, section, filename):
-        try:
-            start = response.find("[")
-            end = response.rfind("]") + 1
-            if start == -1 or end <= start:
-                return []
-
-            raw_tests = json.loads(response[start:end])
-            valid = []
-
-            for idx, t in enumerate(raw_tests):
-                if not isinstance(t, dict):
-                    continue
-                if test_type == "Functional Test":
-                    valid.append({
-                        "name": t.get("test_case_id", f"TC-LLD-{idx+1:02d}"),
-                        "test_case_id": t.get("test_case_id", f"TC-LLD-{idx+1:02d}"),
-                        "description": t.get("description", ""),
-                        "steps": t.get("steps", "Step 1: Execute\nStep 2: Verify"),
-                        "expected_result": t.get("expected_result", "System behaves as expected"),
-                        "type": test_type,
-                        "target": t.get("target", section["heading"]),
-                        "format": "professional"
-                    })
-                else:
-                    valid.append({
-                        "name": t.get("name", f"test_{idx+1}"),
-                        "description": t.get("description", ""),
-                        "code": t.get("code", "def test():\n    pass"),
-                        "type": test_type,
-                        "target": t.get("target", section["heading"]),
-                        "format": "code"
-                    })
-            return valid
-
-        except Exception as e:
-            logger.error(f"❌ Response parse error: {e}")
-            return []
-
-    # ──────────────────────────────────────────────────────────────────
-    # LLM PROMPT
-    # ──────────────────────────────────────────────────────────────────
-
-    def _build_lld_prompt(self, heading: str, content: str, sec_type: str, test_type: str) -> str:
-        content = content[:2000]
-        if test_type == "Unit Test":
-            return f"""You are a QA engineer. Read this LLD section and generate unit test cases.
-
-SECTION HEADING: {heading}
-SECTION TYPE: {sec_type}
-SECTION CONTENT:
-{content}
-
-Generate 3-5 unit test cases based on the above LLD content.
-Each test must be specific to the described functionality, not generic.
-
-Return ONLY a valid JSON array, no explanation, no markdown:
-[
-  {{
-    "name": "test_register_user_success",
-    "description": "Tests that register_user creates a new user when valid inputs are provided",
-    "code": "def test_register_user_success():\\n    # Arrange\\n    username = 'testuser'\\n    password = 'Test@1234'\\n    # Act\\n    result = user_service.register_user(username, password, email)\\n    # Assert\\n    assert result['user_id'] is not None",
-    "target": "register_user"
-  }}
-]"""
-        else:
-            return f"""You are a QA engineer. Read this LLD section and generate functional test cases.
-
-SECTION HEADING: {heading}
-SECTION TYPE: {sec_type}
-SECTION CONTENT:
-{content}
-
-Generate 3-5 functional test cases based on the above LLD content.
-Each test must be specific to the described functionality, not generic.
-
-Return ONLY a valid JSON array, no explanation, no markdown:
-[
-  {{
-    "test_case_id": "TC-FN-01",
-    "description": "Verify that user registration succeeds with valid inputs",
-    "steps": "Step 1: Send POST /api/v1/register with valid username, password, email\\nStep 2: Verify response status is 201\\nStep 3: Verify response contains user_id",
-    "expected_result": "User is created successfully. Response returns 201 with user_id and success message.",
-    "target": "register_user"
-  }}
-]"""
 
     # ──────────────────────────────────────────────────────────────────
     # SMART FALLBACK — extracts every item from structured docx content
@@ -377,10 +276,6 @@ Return ONLY a valid JSON array, no explanation, no markdown:
         return tests
 
     def _extract_testable_items(self, section: Dict) -> List[Dict]:
-        """
-        Extract every testable item from a section's structured lines.
-        Uses 'P' (paragraph) and 'T' (table row) types correctly.
-        """
         heading = section["heading"]
         sec_type = section["type"]
         lines = section["lines"]
@@ -389,70 +284,47 @@ Return ONLY a valid JSON array, no explanation, no markdown:
         para_lines = [text for ltype, text in lines if ltype == "P"]
         items = []
 
-        # ── CLASS: every method row ────────────────────────────────────
         if sec_type == "class":
             for row in table_rows:
                 if row.lower() in HEADER_ROWS:
                     continue
                 m = re.match(r'^([a-z][a-z0-9_]+)\(\)\s*\|\s*([^|]+)\|(.+)', row)
                 if m:
-                    method = m.group(1).strip()
-                    params = m.group(2).strip()
-                    desc = m.group(3).strip()
                     items.append({
-                        'type': 'method', 'name': method,
-                        'target': method, 'params': params,
-                        'desc': desc, 'context': heading
+                        'type': 'method', 'name': m.group(1).strip(),
+                        'target': m.group(1).strip(), 'params': m.group(2).strip(),
+                        'desc': m.group(3).strip(), 'context': heading
                     })
 
-        # ── API: every endpoint row ────────────────────────────────────
         elif sec_type == "api":
             for row in table_rows:
                 if row.lower() in HEADER_ROWS:
                     continue
                 m = re.match(r'^(GET|POST|PUT|DELETE|PATCH)\s*\|\s*(/[\w/\-{}]+)\s*\|(.+)', row)
                 if m:
-                    http_m = m.group(1)
-                    path = m.group(2).strip()
-                    rest = m.group(3).strip()
-                    # response is last pipe-separated part
-                    parts = [p.strip() for p in rest.split('|')]
-                    response = parts[-1] if parts else ""
-                    name = (path.strip('/').replace('/', '_').replace('-', '_')
-                            .replace('{', '').replace('}', ''))
+                    http_m, path = m.group(1), m.group(2).strip()
+                    parts = [p.strip() for p in m.group(3).split('|')]
+                    name = path.strip('/').replace('/', '_').replace('-', '_').replace('{', '').replace('}', '')
                     items.append({
-                        'type': 'api',
-                        'name': f"{http_m.lower()}_{name}",
-                        'target': f"{http_m} {path}",
-                        'response': response,
+                        'type': 'api', 'name': f"{http_m.lower()}_{name}",
+                        'target': f"{http_m} {path}", 'response': parts[-1] if parts else "",
                         'context': heading
                     })
 
-        # ── DATABASE: every column row ─────────────────────────────────
         elif sec_type == "database":
             columns = []
             for row in table_rows:
                 if row.lower() in HEADER_ROWS:
                     continue
                 parts = [p.strip() for p in row.split('|')]
-                if len(parts) >= 4:
-                    col_name, col_type, constraint, col_desc = (
-                        parts[0], parts[1], parts[2], parts[3]
-                    )
-                    if re.match(r'^(INT|VARCHAR|TEXT|BOOLEAN|DATETIME|FLOAT|BIGINT)', col_type, re.I):
-                        columns.append({
-                            'name': col_name, 'type': col_type,
-                            'constraint': constraint, 'description': col_desc
-                        })
+                if len(parts) >= 4 and re.match(r'^(INT|VARCHAR|TEXT|BOOLEAN|DATETIME|FLOAT|BIGINT|DECIMAL)', parts[1], re.I):
+                    columns.append({'name': parts[0], 'type': parts[1], 'constraint': parts[2], 'description': parts[3]})
             if columns:
                 tbl = re.search(r'Table:\s*(\w+)', heading)
                 table_name = tbl.group(1) if tbl else heading
-                items.append({
-                    'type': 'database', 'name': f"table_{table_name.lower()}",
-                    'target': table_name, 'columns': columns, 'context': heading
-                })
+                items.append({'type': 'database', 'name': f"table_{table_name.lower()}",
+                              'target': table_name, 'columns': columns, 'context': heading})
 
-        # ── ERROR CODES: every error row ───────────────────────────────
         elif sec_type == "error":
             errors = []
             for row in table_rows:
@@ -460,49 +332,33 @@ Return ONLY a valid JSON array, no explanation, no markdown:
                     continue
                 m = re.match(r'^(\d{3})\s*\|\s*(\w+)\s*\|\s*(.+)', row)
                 if m:
-                    errors.append({
-                        'code': m.group(1),
-                        'name': m.group(2),
-                        'desc': m.group(3).strip()
-                    })
+                    errors.append({'code': m.group(1), 'name': m.group(2), 'desc': m.group(3).strip()})
             if errors:
-                items.append({
-                    'type': 'error', 'name': 'error_handling',
-                    'target': heading, 'errors': errors, 'context': heading
-                })
+                items.append({'type': 'error', 'name': 'error_handling',
+                              'target': heading, 'errors': errors, 'context': heading})
 
-        # ── FLOW: paragraph lines are the steps ────────────────────────
         elif sec_type == "flow":
             steps = [t for t in para_lines if len(t) > 5]
             if steps:
                 safe = re.sub(r'\W+', '_', heading.lower())[:40]
-                items.append({
-                    'type': 'flow', 'name': safe,
-                    'target': heading, 'steps': steps, 'context': heading
-                })
+                items.append({'type': 'flow', 'name': safe,
+                              'target': heading, 'steps': steps, 'context': heading})
 
-        # ── VALIDATION: paragraph lines are the rules ──────────────────
         elif sec_type == "validation":
             rules = [t for t in para_lines if len(t) > 5]
             if rules:
                 safe = re.sub(r'\W+', '_', heading.lower())[:40]
-                items.append({
-                    'type': 'validation', 'name': safe,
-                    'target': heading, 'rules': rules, 'context': heading
-                })
+                items.append({'type': 'validation', 'name': safe,
+                              'target': heading, 'rules': rules, 'context': heading})
 
-        # ── GENERAL: use heading as single item ────────────────────────
         if not items:
             safe = re.sub(r'\W+', '_', heading.lower())[:40]
-            items.append({
-                'type': 'general', 'name': safe,
-                'target': heading, 'context': heading
-            })
+            items.append({'type': 'general', 'name': safe, 'target': heading, 'context': heading})
 
         return items
 
     # ──────────────────────────────────────────────────────────────────
-    # UNIT TEST BUILDER
+    # UNIT TEST BUILDER (fallback only)
     # ──────────────────────────────────────────────────────────────────
 
     def _build_unit_test(self, item: Dict, filename: str, index: int) -> Dict:
@@ -513,122 +369,61 @@ Return ONLY a valid JSON array, no explanation, no markdown:
         if t == 'method':
             params = item.get('params', '')
             desc_text = item.get('desc', '')
-            param_list = ', '.join([
-                p.strip().split()[0] for p in params.split(',') if p.strip()
-            ]) if params else '...'
-            code = (
-                f"def {name}():\n"
-                f'    """\n'
-                f"    Unit Test for: {target}({params})\n"
-                f"    Description: {desc_text}\n"
-                f"    LLD Section: {item['context']}\n"
-                f'    """\n'
-                f"    # Arrange\n"
-                f"    # TODO: prepare inputs — {params}\n\n"
-                f"    # Act\n"
-                f"    # result = {target}({param_list})\n\n"
-                f"    # Assert\n"
-                f"    # assert result is not None"
-            )
+            param_list = ', '.join([p.strip().split()[0] for p in params.split(',') if p.strip()]) if params else '...'
+            code = (f"def {name}():\n    \"\"\"\n    Unit Test for: {target}({params})\n"
+                    f"    Description: {desc_text}\n    LLD Section: {item['context']}\n    \"\"\"\n"
+                    f"    # Arrange\n    # TODO: prepare inputs — {params}\n\n"
+                    f"    # Act\n    # result = {target}({param_list})\n\n"
+                    f"    # Assert\n    # assert result is not None")
             desc = f"Unit test for {target}({params}) — {desc_text[:80]}"
-
         elif t == 'api':
             parts = target.split(' ', 1)
             http_m, path = parts[0], parts[1] if len(parts) > 1 else ''
             resp = item.get('response', '')
-            code = (
-                f"def {name}():\n"
-                f'    """\n'
-                f"    Unit Test for API: {target}\n"
-                f"    Expected response: {resp}\n"
-                f'    """\n'
-                f"    # Arrange\n"
-                f"    # TODO: prepare payload for {http_m} {path}\n\n"
-                f"    # Act\n"
-                f"    # response = client.{http_m.lower()}('{path}')\n\n"
-                f"    # Assert\n"
-                f"    # assert response.status_code in [200, 201]"
-            )
+            code = (f"def {name}():\n    \"\"\"\n    Unit Test for API: {target}\n"
+                    f"    Expected response: {resp}\n    \"\"\"\n"
+                    f"    # Arrange\n    # TODO: prepare payload for {http_m} {path}\n\n"
+                    f"    # Act\n    # response = client.{http_m.lower()}('{path}')\n\n"
+                    f"    # Assert\n    # assert response.status_code in [200, 201]")
             desc = f"Unit test for API endpoint: {target}"
-
         elif t == 'database':
             table = item['target']
             cols = item.get('columns', [])
-            col_checks = "\n    # ".join([
-                f"assert '{c['name']}' in result  # {c['type']} {c['constraint']}"
-                for c in cols[:6]
-            ])
-            code = (
-                f"def {name}():\n"
-                f'    """\n'
-                f"    Unit Test for DB table: {table}\n"
-                f"    Columns: {', '.join([c['name'] for c in cols])}\n"
-                f'    """\n'
-                f"    # Arrange: insert test record into {table}\n\n"
-                f"    # Act\n"
-                f"    # result = db.query('SELECT * FROM {table} WHERE ...')\n\n"
-                f"    # Assert\n"
-                f"    # {col_checks}"
-            )
+            col_checks = "\n    # ".join([f"assert '{c['name']}' in result  # {c['type']} {c['constraint']}" for c in cols[:6]])
+            code = (f"def {name}():\n    \"\"\"\n    Unit Test for DB table: {table}\n"
+                    f"    Columns: {', '.join([c['name'] for c in cols])}\n    \"\"\"\n"
+                    f"    # Arrange: insert test record into {table}\n\n"
+                    f"    # Act\n    # result = db.query('SELECT * FROM {table} WHERE ...')\n\n"
+                    f"    # Assert\n    # {col_checks}")
             desc = f"Unit test for DB table: {table} ({len(cols)} columns: {', '.join([c['name'] for c in cols])})"
-
         elif t == 'error':
             errors = item.get('errors', [])
-            error_lines = "\n    # ".join([
-                f"[{e['code']}] {e['name']}: {e['desc']}" for e in errors
-            ])
-            code = (
-                f"def {name}():\n"
-                f'    """\n'
-                f"    Unit Test for all error codes\n"
-                f'    """\n'
-                f"    # Error scenarios to cover:\n"
-                f"    # {error_lines}\n\n"
-                f"    pass"
-            )
+            error_lines = "\n    # ".join([f"[{e['code']}] {e['name']}: {e['desc']}" for e in errors])
+            code = (f"def {name}():\n    \"\"\"\n    Unit Test for all error codes\n    \"\"\"\n"
+                    f"    # Error scenarios to cover:\n    # {error_lines}\n\n    pass")
             desc = f"Unit test for error codes: {', '.join([e['code']+' '+e['name'] for e in errors])}"
-
         elif t == 'flow':
             steps = item.get('steps', [])
             steps_txt = "\n    # ".join([f"Step {i+1}: {s}" for i, s in enumerate(steps)])
-            code = (
-                f"def {name}():\n"
-                f'    """\n'
-                f"    Unit Test for flow: {item['context']}\n"
-                f'    """\n'
-                f"    # Flow steps:\n"
-                f"    # {steps_txt}\n\n"
-                f"    pass"
-            )
+            code = (f"def {name}():\n    \"\"\"\n    Unit Test for flow: {item['context']}\n    \"\"\"\n"
+                    f"    # Flow steps:\n    # {steps_txt}\n\n    pass")
             desc = f"Unit test for flow: {item['context']} ({len(steps)} steps)"
-
         elif t == 'validation':
             rules = item.get('rules', [])
             rules_txt = "\n    # ".join([f"Rule {i+1}: {r}" for i, r in enumerate(rules)])
-            code = (
-                f"def {name}():\n"
-                f'    """\n'
-                f"    Unit Test for validation: {item['context']}\n"
-                f'    """\n'
-                f"    # Validation rules:\n"
-                f"    # {rules_txt}\n\n"
-                f"    pass"
-            )
+            code = (f"def {name}():\n    \"\"\"\n    Unit Test for validation: {item['context']}\n    \"\"\"\n"
+                    f"    # Validation rules:\n    # {rules_txt}\n\n    pass")
             desc = f"Unit test for validation: {item['context']} ({len(rules)} rules)"
-
         else:
             code = f"def {name}():\n    \"\"\" {item['context']} \"\"\"\n    pass"
             desc = f"Unit test for: {item['context']}"
 
-        return {
-            'name': name, 'description': desc, 'code': code,
-            'type': 'Unit Test', 'target': target, 'file': filename,
-            'chunk_name': item['context'], 'chunk_type': t,
-            'source': 'lld', 'fallback': True, 'format': 'code'
-        }
+        return {'name': name, 'description': desc, 'code': code, 'type': 'Unit Test',
+                'target': target, 'file': filename, 'chunk_name': item['context'],
+                'chunk_type': t, 'source': 'lld', 'fallback': True, 'format': 'code'}
 
     # ──────────────────────────────────────────────────────────────────
-    # FUNCTIONAL TEST BUILDER
+    # FUNCTIONAL TEST BUILDER (fallback only)
     # ──────────────────────────────────────────────────────────────────
 
     def _build_functional_test(self, item: Dict, filename: str, index: int) -> Dict:
@@ -640,99 +435,62 @@ Return ONLY a valid JSON array, no explanation, no markdown:
             params = item.get('params', '')
             desc_text = item.get('desc', '')
             desc = f"Verify {target}() behaves correctly — {desc_text[:80]}"
-            steps = (
-                f"Step 1: Set up required dependencies for {target}\n"
-                f"Step 2: Call {target}({params})\n"
-                f"Step 3: Verify return value is correct and not null\n"
-                f"Step 4: Verify no unexpected exceptions are raised"
-            )
+            steps = (f"Step 1: Set up required dependencies for {target}\n"
+                     f"Step 2: Call {target}({params})\n"
+                     f"Step 3: Verify return value is correct and not null\n"
+                     f"Step 4: Verify no unexpected exceptions are raised")
             expected = f"{target}() completes successfully. {desc_text}"
-
         elif t == 'api':
             parts = target.split(' ', 1)
             http_m, path = parts[0], parts[1] if len(parts) > 1 else ''
             resp = item.get('response', '')
             desc = f"Verify {http_m} {path} returns correct response"
-            steps = (
-                f"Step 1: Prepare valid request payload for {http_m} {path}\n"
-                f"Step 2: Send {http_m} request to {path} with required headers\n"
-                f"Step 3: Verify response status code is correct\n"
-                f"Step 4: Verify response body matches expected: {resp[:120] if resp else 'success'}"
-            )
+            steps = (f"Step 1: Prepare valid request payload for {http_m} {path}\n"
+                     f"Step 2: Send {http_m} request to {path} with required headers\n"
+                     f"Step 3: Verify response status code is correct\n"
+                     f"Step 4: Verify response body matches expected: {resp[:120] if resp else 'success'}")
             expected = f"{http_m} {path} returns: {resp if resp else 'success response with correct fields'}"
-
         elif t == 'database':
             table = item['target']
             cols = item.get('columns', [])
             not_null = [c for c in cols if 'NOT NULL' in c.get('constraint', '').upper()]
             unique_cols = [c for c in cols if 'UNIQUE' in c.get('constraint', '').upper()]
             desc = f"Verify table {table} stores data correctly and enforces all constraints"
-            steps = (
-                f"Step 1: Insert a valid record into {table} with all {len(cols)} fields\n"
-                f"Step 2: Verify all columns are stored correctly\n"
-                f"Step 3: Attempt to insert record missing NOT NULL fields: "
-                f"{', '.join([c['name'] for c in not_null[:3]])}\n"
-                f"Step 4: Verify constraint violation is raised\n"
-                + (f"Step 5: Attempt to insert duplicate values for UNIQUE columns: "
-                   f"{', '.join([c['name'] for c in unique_cols[:2]])}\n"
-                   f"Step 6: Verify uniqueness constraint is enforced"
-                   if unique_cols else "")
-            )
-            expected = (
-                f"Table {table} correctly stores valid records and enforces "
-                f"all constraints across {len(cols)} columns"
-            )
-
+            steps = (f"Step 1: Insert a valid record into {table} with all {len(cols)} fields\n"
+                     f"Step 2: Verify all columns are stored correctly\n"
+                     f"Step 3: Attempt to insert record missing NOT NULL fields: {', '.join([c['name'] for c in not_null[:3]])}\n"
+                     f"Step 4: Verify constraint violation is raised\n"
+                     + (f"Step 5: Attempt to insert duplicate values for UNIQUE columns: {', '.join([c['name'] for c in unique_cols[:2]])}\n"
+                        f"Step 6: Verify uniqueness constraint is enforced" if unique_cols else ""))
+            expected = f"Table {table} correctly stores valid records and enforces all constraints across {len(cols)} columns"
         elif t == 'error':
             errors = item.get('errors', [])
             desc = "Verify system returns correct HTTP error codes for all invalid scenarios"
-            steps = "\n".join([
-                f"Step {i+1}: Trigger {e['name']} ({e['code']}) — {e['desc']}"
-                for i, e in enumerate(errors)
-            ])
-            expected = (
-                f"System returns correct HTTP status codes for all error scenarios: "
-                f"{', '.join([e['code']+' ('+e['name']+')' for e in errors])}"
-            )
-
+            steps = "\n".join([f"Step {i+1}: Trigger {e['name']} ({e['code']}) — {e['desc']}" for i, e in enumerate(errors)])
+            expected = f"System returns correct HTTP status codes for all error scenarios: {', '.join([e['code']+' ('+e['name']+')' for e in errors])}"
         elif t == 'flow':
             steps_list = item.get('steps', [])
             desc = f"Verify the complete flow: {item['context']}"
-            steps = "\n".join([
-                f"Step {i+1}: {s}" for i, s in enumerate(steps_list)
-            ])
-            expected = (
-                f"All {len(steps_list)} steps in '{item['context']}' "
-                f"complete successfully in the correct sequence"
-            )
-
+            steps = "\n".join([f"Step {i+1}: {s}" for i, s in enumerate(steps_list)])
+            expected = f"All {len(steps_list)} steps in '{item['context']}' complete successfully in the correct sequence"
         elif t == 'validation':
             rules = item.get('rules', [])
             desc = f"Verify all {len(rules)} validation rules for: {item['context']}"
-            steps = (
-                f"Step 1: Submit input violating each rule:\n"
-                + "\n".join([f"         Rule {i+1}: {r}" for i, r in enumerate(rules)])
-                + f"\nStep 2: Verify system rejects each invalid input with correct error\n"
-                f"Step 3: Submit input satisfying all {len(rules)} rules\n"
-                f"Step 4: Verify system accepts valid input"
-            )
-            expected = (
-                f"System enforces all {len(rules)} validation rules in "
-                f"'{item['context']}'. Invalid input rejected, valid input accepted."
-            )
-
+            steps = (f"Step 1: Submit input violating each rule:\n"
+                     + "\n".join([f"         Rule {i+1}: {r}" for i, r in enumerate(rules)])
+                     + f"\nStep 2: Verify system rejects each invalid input with correct error\n"
+                     f"Step 3: Submit input satisfying all {len(rules)} rules\n"
+                     f"Step 4: Verify system accepts valid input")
+            expected = f"System enforces all {len(rules)} validation rules in '{item['context']}'. Invalid input rejected, valid input accepted."
         else:
             desc = f"Verify: {item['context']}"
-            steps = f"Step 1: Set up scenario\nStep 2: Execute operation\nStep 3: Verify outcome"
+            steps = "Step 1: Set up scenario\nStep 2: Execute operation\nStep 3: Verify outcome"
             expected = f"System behaves as described in LLD section '{item['context']}'"
 
-        return {
-            'name': tc_id, 'test_case_id': tc_id,
-            'description': desc, 'steps': steps, 'expected_result': expected,
-            'type': 'Functional Test', 'target': target, 'file': filename,
-            'chunk_name': item['context'], 'chunk_type': t,
-            'source': 'lld', 'fallback': True, 'format': 'professional'
-        }
+        return {'name': tc_id, 'test_case_id': tc_id, 'description': desc, 'steps': steps,
+                'expected_result': expected, 'type': 'Functional Test', 'target': target,
+                'file': filename, 'chunk_name': item['context'], 'chunk_type': t,
+                'source': 'lld', 'fallback': True, 'format': 'professional'}
 
     # ──────────────────────────────────────────────────────────────────
     # RAG STORAGE
