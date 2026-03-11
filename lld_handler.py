@@ -81,10 +81,12 @@ class LLDHandler:
 
         all_tests: Dict[str, List[Dict]] = {"Unit Test": [], "Functional Test": []}
 
+        tc_counter = 1
         for test_type in test_types:
             logger.info(f"🔧 Generating {test_type}s from LLD...")
-            tests = self._generate_tests_from_sections(sections, test_type, filename)
+            tests = self._generate_tests_from_sections(sections, test_type, filename, tc_counter)
             all_tests[test_type] = tests
+            tc_counter += len(tests)
             logger.info(f"✅ Generated {len(tests)} {test_type}s")
 
         total = sum(len(v) for v in all_tests.values())
@@ -208,10 +210,10 @@ class LLDHandler:
         self,
         sections: List[Dict],
         test_type: str,
-        filename: str
+        filename: str,
+        tc_index: int = 1
     ) -> List[Dict]:
         all_tests = []
-        tc_index = 1
 
         for i, section in enumerate(sections, 1):
             heading = section["heading"]
